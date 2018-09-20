@@ -104,7 +104,7 @@ local function get_cred_scope(timestamp, region, service)
 end
 
 local function get_signed_headers()
-	return "host"
+	return "content-length;content-type;host"
 end
 
 local function get_credential(keys, timestamp, region, service)
@@ -132,12 +132,14 @@ local function get_canonical_query_string(timestamp, host, credential, request_m
 	return table.concat(qs_list, "&")
 end
 
-local function get_hashed_canonical_request(timestamp, host, uri, request_method, credential)
+local function get_hashed_canonical_request(timestamp, host, uri, request_method, credential, size, mime)
 	local unsigned_payload = "UNSIGNED-PAYLOAD"
 	local canonical_query_string = get_canonical_query_string(timestamp, host, credential, request_method)
 	local canonical_request = request_method .. "\n"
 		.. uri .. "\n"
 		.. canonical_query_string .. "\n"
+		.. "content-length:" .. size .."\n"
+		.. "content-type:" .. mime .."\n"
 		.. "host:" .. host .. "\n"
 		.. "\n"
 		.. get_signed_headers() .. "\n"
@@ -145,11 +147,11 @@ local function get_hashed_canonical_request(timestamp, host, uri, request_method
 	return SHA256(canonical_request, true)
 end
 
-local function get_string_to_sign(timestamp, region, service, host, uri, request_method, credential)
+local function get_string_to_sign(timestamp, region, service, host, uri, request_method, credential, size, mime)
 	return "AWS4-HMAC-SHA256\n"
 		.. get_iso8601_basic(timestamp) .. "\n"
 		.. get_cred_scope(timestamp, region, service) .. "\n"
-		.. get_hashed_canonical_request(timestamp, host, uri, request_method, credential)
+		.. get_hashed_canonical_request(timestamp, host, uri, request_method, credential, size, mime)
 end
 
 local function get_signature(derived_signing_key, string_to_sign)
@@ -164,10 +166,12 @@ local function build_uri(host, uri, query_string)
 	return url
 end
 
-local function build_signed_url(keys, timestamp, region, service, host, uri, request_method)
+local function build_signed_url(keys, timestamp, region, service, host, uri, request_method, size, mime)
+	-- we are using AWS Signature V 4 with query parameters instead of headers
+	-- ref: https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html
 	local derived_signing_key = get_derived_signing_key(keys, timestamp, region, service)
 	local credential          = get_credential(keys, timestamp, region, service)
-	local string_to_sign      = get_string_to_sign(timestamp, region, service, host, uri, request_method, credential)
+	local string_to_sign      = get_string_to_sign(timestamp, region, service, host, uri, request_method, credential, size, mime)
 	local signature           = get_signature(derived_signing_key, string_to_sign)
 	local query_string        = get_canonical_query_string(timestamp, host, credential, request_method)
 	local signed_query_string = query_string .. "&X-Amz-Signature=" .. signature
@@ -186,17 +190,10 @@ local function get_public_get(service, region, uri)
 	return url
 end
 
-local function get_presigned_get(credentials, service, region, uri)
+local function get_presigned_put(credentials, service, region, uri, size, mime)
 	local timestamp = tonumber(os.time())
 	local host      = build_host(service, region)
-	local url       = build_signed_url(credentials, timestamp, region, service, host, uri, "GET")
-	return url
-end
-
-local function get_presigned_put(credentials, service, region, uri)
-	local timestamp = tonumber(os.time())
-	local host      = build_host(service, region)
-	local url       = get_authorization(credentials, timestamp, region, service, host, uri, "PUT")
+	local url       = build_signed_url(credentials, timestamp, region, service, host, uri, "PUT", size, mime)
 	return url
 end
 
@@ -228,7 +225,8 @@ local function handle_request(origin, stanza, xmlns, filename, filesize, filetyp
 	local random  = http.urlencode(uuid());
 	filename      = http.urlencode(filename)
 	local uri     = string.format("/%s/%s/%s-%s", aws_bucket, aws_path, random, filename);
-	local put_url = get_presigned_put(aws_creds, aws_service, aws_region, uri);
+	module:log("debug", "slot request %s %s", filesize, filetype);
+	local put_url = get_presigned_put(aws_creds, aws_service, aws_region, uri, filesize, filetype);
 	local get_url = get_public_get(aws_service, aws_region, uri);
 
 	module:log("debug", "Handing out upload slot GET %s PUT %s to %s@%s [%d %s]", get_url, put_url, origin.username, origin.host, filesize, filetype);
@@ -263,10 +261,10 @@ end);
 
 module:hook("iq/host/"..namespace..":request", function (event)
 	local stanza, origin = event.stanza, event.origin;
-	local request = stanza.tags[1];
-	local filename = request.attr.filename;
-	local filesize = tonumber(request.attr.size);
-	local filetype = request.attr["content-type"] or "application/octet-stream";
+	local request        = stanza.tags[1];
+	local filename       = request.attr.filename;
+	local filesize       = tonumber(request.attr.size);
+	local filetype       = request.attr["content-type"] or "application/octet-stream";
 
 	local get_url, put_url = handle_request(
 		origin, stanza, namespace, filename, filesize, filetype);
